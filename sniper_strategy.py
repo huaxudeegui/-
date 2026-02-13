@@ -1,71 +1,88 @@
-docker exec -i hummingbot-instance bash -c "cat << 'EOF' > /home/hummingbot/scripts/sniper_strategy.py
 # -*- coding: utf-8 -*-
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 from hummingbot.core.data_type.common import OrderType
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from decimal import Decimal
+import pandas as pd
 
 class SniperStrategy(ScriptStrategyBase):
-    trading_pair = 'PIPPIN-USDT'
-    exchange = 'binance_perpetual_testnet'
+    trading_pair = "PIPPIN-USDT"
+    exchange = "binance_perpetual_testnet"
     
+    # 参数设置
     ema_length = 14
-    deviation_threshold = Decimal('0.001')
-    callback_rate = Decimal('0.0005')
-    order_amount_usdt = Decimal('20')
+    deviation_threshold = Decimal("0.001")
+    callback_rate = Decimal("0.0005")
+    order_amount_usdt = Decimal("20")
     
+    # 初始化市场和 K 线订阅
     markets = {exchange: {trading_pair}}
-    is_locked = False
-    highest_price = Decimal('0')
+    # 创建 15 分钟 K 线喂价
+    candles = CandlesFactory.get_candle(connector=exchange, trading_pair=trading_pair, interval="15m", max_records=50)
+    
+    def __init__(self, connectors):
+        super().__init__(connectors)
+        self.is_locked = False
+        self.highest_price = Decimal("0")
+        # 启动 K 线数据推送
+        self.candles.start()
+
+    def on_stop(self):
+        self.candles.stop()
 
     def on_tick(self):
         try:
             connector = self.connectors[self.exchange]
-            # 增加检查：如果连接器没准备好或 K 线没加载完，就直接跳过
-            if not connector.ready:
+            if not connector.ready or not self.candles.ready:
                 return
 
             current_price = connector.get_mid_price(self.trading_pair)
-            if current_price is None or current_price.is_nan():
+            
+            # 获取 K 线 DataFrame 并计算 EMA
+            df = self.candles.candles_df
+            if len(df) < self.ema_length:
                 return
 
-            candles = connector.get_candles(self.trading_pair, '15m', self.ema_length + 5)
-            if len(candles) < self.ema_length:
-                self.logger().info(f'数据收集中心: 已获取 {len(candles)} 根 K 线...')
-                return
+            # 计算 EMA (使用 pandas 效率更高且准确)
+            close_series = df['close'].astype(float)
+            ema_value = close_series.ewm(span=self.ema_length, adjust=False).mean().iloc[-1]
+            ema = Decimal(str(ema_value))
 
-            close_prices = [Decimal(str(c.close)) for c in candles]
-            ema = self.calculate_ema(close_prices, self.ema_length)
             deviation = (current_price - ema) / ema
             
-            # 实时输出，确认逻辑在跑
-            self.logger().info(f'价格: {current_price:.4f} | EMA: {ema:.4f} | 偏离: {deviation*100:.2f}%')
+            # 日志输出
+            self.logger().info(f"Price: {current_price:.6f} | EMA: {ema:.6f} | Dev: {deviation*100:.3f}%")
 
             if not self.is_locked:
                 if deviation >= self.deviation_threshold:
                     self.is_locked = True
                     self.highest_price = current_price
-                    self.logger().info(f'🔒 偏离触发，进入锁定模式! 最高价: {current_price}')
+                    self.logger().info(f"🔒 偏离触发，进入监测模式! 当前价: {current_price}")
             else:
+                # 更新最高价
                 if current_price > self.highest_price:
                     self.highest_price = current_price
+                
+                # 回调逻辑
                 if current_price <= self.highest_price * (1 - self.callback_rate):
-                    self.logger().info(f'🚀 回调确认，执行开空!')
-                    self.place_order(current_price)
-                    self.is_locked = False
+                    self.logger().info(f"🚀 回调确认: {current_price} <= {self.highest_price} * (1-{self.callback_rate})")
+                    self.execute_sell(current_price)
+                    self.is_locked = False # 交易后解锁
+                    
         except Exception as e:
-            # 捕获异常并打印，防止整个机器人日志刷屏红字
-            self.logger().error(f'脚本运行异常: {str(e)}')
+            self.logger().error(f"脚本异常: {str(e)}")
 
-    def place_order(self, price):
-        amount = self.order_amount_usdt / price
-        self.sell(self.exchange, self.trading_pair, amount, OrderType.MARKET)
-
-    def calculate_ema(self, prices, period):
-        alpha = Decimal(2) / (Decimal(period) + Decimal(1))
-        ema = prices[0]
-        for p in prices[1:]:
-            ema = (p * alpha) + (ema * (Decimal(1) - alpha))
-        return ema
-EOF"
-            ema = (p * alpha) + (ema * (Decimal(1) - alpha))
-        return ema
+    def execute_sell(self, price):
+        connector = self.connectors[self.exchange]
+        # 计算下单量并进行精度校正 (Quantize)
+        raw_amount = self.order_amount_usdt / price
+        quantized_amount = connector.quantize_order_amount(self.trading_pair, raw_amount)
+        
+        if quantized_amount > 0:
+            self.sell(
+                self.exchange,
+                self.trading_pair,
+                quantized_amount,
+                OrderType.MARKET
+            )
+            self.logger().info(f"✅ 已投单: {quantized_amount} {self.trading_pair}")
